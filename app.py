@@ -679,7 +679,7 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service(page):
+def renew_service(page, _retry=0):
 
     try:
         log("➡ 进入续期流程...")
@@ -760,14 +760,87 @@ def renew_service(page):
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
+            if "/payment/invoice/" in page.url and page_ready(page):
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, reload_after=8)
+
+            # Create Invoice 有时会在新标签页打开发票
+            for p in page.context.pages:
+                if p is not page and "/payment/invoice/" in (p.url or '') and page_ready(p):
+                    page = p
+                    new_invoice_url = p.url
+                    log(f"🎉 新标签页已打开: {new_invoice_url}")
+                    break
+            if new_invoice_url:
+                break
+
+            # 弹窗内 Turnstile 通过后 iframe 不会消失，不能据此判断拦截；
+            # 只有整页 Cloudflare 安全验证页才需要处理。
+            if not page_ready(page):
+                log("⚠️ 遇到整页拦截，尝试处理...")
+                solve_turnstile(page, timeout=45, success_check=page_ready, reload_after=8)
+            else:
+                st = turnstile_state(page)
+                if st["total"] > 0 and st["solved"] < st["total"]:
+                    log("🛡️ 页面 Turnstile 尚未通过，先处理...")
+                    solve_turnstile(page, timeout=60, require_positive=True,
+                                    shot_on_timeout="modal_turnstile_fail.png")
+                    # 只有表单还没提交、按钮仍可见时才重新点击
+                    try:
+                        if create_btn.first.is_visible():
+                            create_btn.click(timeout=8000)
+                            log("🔄 Turnstile 已通过，重新点击 'Create Invoice'...")
+                    except Exception:
+                        pass
             time.sleep(1)
+
+        # 兜底：创建发票后可能被 CF / 登录页 / 其他跳转打断，
+        # 直接去该服务的未付账单列表里找刚生成的发票。
+        if not new_invoice_url:
+            if "/auth/login" in page.url:
+                log("🔐 续期过程中被重定向到登录页，重新登录...")
+                try:
+                    login(page)
+                except Exception as e:
+                    log(f"⚠️ 重新登录异常: {e}")
+            try:
+                m = re.search(r'/service/(\d+)/manage', SERVICE_URL)
+                if m:
+                    invoices_url = f"{BASE_URL}/service/{m.group(1)}/invoices?where=unpaid"
+                    log(f"➡️ 打开未付账单列表: {invoices_url}")
+                    page.goto(invoices_url, wait_until="domcontentloaded", timeout=60000)
+                    solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+                    links = re.findall(
+                        r'''href=["']([^"']*?/payment/invoice/[^"']+)["']''', page.content())
+                    links = [l.replace('&amp;', '&') for l in links if 'download' not in l]
+                    if links:
+                        link = links[0]
+                        if link.startswith('/'):
+                            link = BASE_URL + link
+                        elif not link.startswith('http'):
+                            link = f"{BASE_URL}/{link}"
+                        new_invoice_url = link
+                        log(f"🔗 找到未付发票: {new_invoice_url}")
+                    else:
+                        log("⚠️ 未付账单列表中没有找到发票")
+            except Exception as e:
+                log(f"⚠️ 未付账单兜底失败: {e}")
+
+        # 还是没发票就重走一次续期流程（服务端会删除同一到期日的重复未付账单）
+        if not new_invoice_url and _retry < 1:
+            log("🔄 仍未获取到发票，重新执行一次续期流程...")
+            if "/auth/login" in page.url:
+                try:
+                    login(page)
+                except Exception:
+                    pass
+            try:
+                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+            except Exception:
+                pass
+            return renew_service(page, _retry + 1)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
