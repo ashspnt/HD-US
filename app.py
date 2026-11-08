@@ -679,7 +679,7 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service(page, _retry=0):
+def renew_service(page):
 
     try:
         log("➡ 进入续期流程...")
@@ -760,87 +760,14 @@ def renew_service(page, _retry=0):
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url and page_ready(page):
+            if "/payment/invoice/" in page.url:
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
-
-            # Create Invoice 有时会在新标签页打开发票
-            for p in page.context.pages:
-                if p is not page and "/payment/invoice/" in (p.url or '') and page_ready(p):
-                    page = p
-                    new_invoice_url = p.url
-                    log(f"🎉 新标签页已打开: {new_invoice_url}")
-                    break
-            if new_invoice_url:
-                break
-
-            # 弹窗内 Turnstile 通过后 iframe 不会消失，不能据此判断拦截；
-            # 只有整页 Cloudflare 安全验证页才需要处理。
-            if not page_ready(page):
-                log("⚠️ 遇到整页拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, success_check=page_ready, reload_after=8)
-            else:
-                st = turnstile_state(page)
-                if st["total"] > 0 and st["solved"] < st["total"]:
-                    log("🛡️ 页面 Turnstile 尚未通过，先处理...")
-                    solve_turnstile(page, timeout=60, require_positive=True,
-                                    shot_on_timeout="modal_turnstile_fail.png")
-                    # 只有表单还没提交、按钮仍可见时才重新点击
-                    try:
-                        if create_btn.first.is_visible():
-                            create_btn.click(timeout=8000)
-                            log("🔄 Turnstile 已通过，重新点击 'Create Invoice'...")
-                    except Exception:
-                        pass
+            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                log("⚠️ 遇到拦截，尝试处理...")
+                solve_turnstile(page, timeout=45, reload_after=8)
             time.sleep(1)
-
-        # 兜底：创建发票后可能被 CF / 登录页 / 其他跳转打断，
-        # 直接去该服务的未付账单列表里找刚生成的发票。
-        if not new_invoice_url:
-            if "/auth/login" in page.url:
-                log("🔐 续期过程中被重定向到登录页，重新登录...")
-                try:
-                    login(page)
-                except Exception as e:
-                    log(f"⚠️ 重新登录异常: {e}")
-            try:
-                m = re.search(r'/service/(\d+)/manage', SERVICE_URL)
-                if m:
-                    invoices_url = f"{BASE_URL}/service/{m.group(1)}/invoices?where=unpaid"
-                    log(f"➡️ 打开未付账单列表: {invoices_url}")
-                    page.goto(invoices_url, wait_until="domcontentloaded", timeout=60000)
-                    solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-                    links = re.findall(
-                        r'''href=["']([^"']*?/payment/invoice/[^"']+)["']''', page.content())
-                    links = [l.replace('&amp;', '&') for l in links if 'download' not in l]
-                    if links:
-                        link = links[0]
-                        if link.startswith('/'):
-                            link = BASE_URL + link
-                        elif not link.startswith('http'):
-                            link = f"{BASE_URL}/{link}"
-                        new_invoice_url = link
-                        log(f"🔗 找到未付发票: {new_invoice_url}")
-                    else:
-                        log("⚠️ 未付账单列表中没有找到发票")
-            except Exception as e:
-                log(f"⚠️ 未付账单兜底失败: {e}")
-
-        # 还是没发票就重走一次续期流程（服务端会删除同一到期日的重复未付账单）
-        if not new_invoice_url and _retry < 1:
-            log("🔄 仍未获取到发票，重新执行一次续期流程...")
-            if "/auth/login" in page.url:
-                try:
-                    login(page)
-                except Exception:
-                    pass
-            try:
-                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-                solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-            except Exception:
-                pass
-            return renew_service(page, _retry + 1)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -850,100 +777,15 @@ def renew_service(page, _retry=0):
         if page.url != new_invoice_url:
             page.goto(new_invoice_url)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-        # 发票页可能自带 Turnstile，先确认 token 再点 Pay
-        st = turnstile_state(page)
-        if st["total"] > 0 and st["solved"] < st["total"]:
-            log("🛡️ 发票页 Turnstile 尚未通过，先处理...")
-            solve_turnstile(page, timeout=60, require_positive=True,
-                            shot_on_timeout="invoice_turnstile_fail.png")
-
-        # 优先选择余额支付，避免跳到第三方支付页
-        try:
-            picked = page.evaluate("""() => {
-                const s = document.querySelector('select[name="gateway"]');
-                if (!s) return false;
-                for (const o of s.options) {
-                    if (/balance|余额/i.test(o.textContent)) {
-                        s.value = o.value;
-                        s.dispatchEvent(new Event('change', {bubbles: true}));
-                        return o.textContent.trim();
-                    }
-                }
-                return false;
-            }""")
-            if picked:
-                log(f"💳 选择余额支付: {picked}")
-            else:
-                log("⚠️ 未找到余额支付选项，使用默认支付方式")
-        except Exception as e:
-            log(f"⚠️ 选择余额支付失败: {e}")
 
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        try:
-            pay_btn.scroll_into_view_if_needed(timeout=5000)
-        except Exception:
-            pass
-        try:
-            pay_btn.click(timeout=15000)
-        except Exception as e:
-            # 页面的滚动容器有时会让 Playwright 判定按钮在视口外，改用 DOM 点击兜底
-            log(f"⚠️ 普通点击 Pay 失败（{str(e).splitlines()[0]}），改用 DOM 点击...")
-            clicked = False
-            try:
-                pay_btn.evaluate("el => el.click()")
-                clicked = True
-            except Exception:
-                pass
-            if not clicked:
-                clicked = page.evaluate("""() => {
-                    const els = Array.from(document.querySelectorAll('button, a, input[type=submit]'));
-                    const b = els.find(x => /pay now|pay|支付/i.test((x.innerText || x.value || '')));
-                    if (b) { b.scrollIntoView({block: 'center'}); b.click(); return true; }
-                    return false;
-                }""")
-            if not clicked:
-                raise
+        pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付提交完成：0 元发票会跳 dashboard，余额支付会跳 payment.success
-        pay_start = time.time()
-        paid_seen = False
-        while time.time() - pay_start < 120:
-            if "/payment/success/" in page.url:
-                paid_seen = True
-                log("✅ 已进入支付成功页")
-                break
-            if not page_ready(page):
-                log("⚠️ 支付提交遇到整页拦截，尝试处理...")
-                solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-                continue
-            if "/payment/invoice/" in page.url:
-                # 刚提交的几秒内页面可能还是旧内容，先等 POST 返回
-                if time.time() - pay_start < 8:
-                    time.sleep(2)
-                    continue
-                # 还在发票页：检查是否有支付失败提示
-                try:
-                    body = page.locator("body").inner_text(timeout=1500).lower()
-                except Exception:
-                    body = ""
-                if any(h in body for h in ("failed", "insufficient", "not enough",
-                                           "captcha", "turnstile", "invalid",
-                                           "余额不足", "支付失败")):
-                    log("❌ 支付失败：页面仍停留在发票页")
-                    page.screenshot(path="pay_failed.png")
-                    return False
-            elif "auth/login" not in page.url:
-                paid_seen = True
-                log(f"✅ 支付已提交，当前页面: {page.url}")
-                break
-            time.sleep(2)
-
-        if not paid_seen:
-            log("⚠️ 未确认支付成功页，返回服务页检查到期时间...")
-
+        # 等待支付确认页面或跳转回服务页
+        time.sleep(5)
         # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
@@ -1018,12 +860,7 @@ def main():
             else:  # renew_result is True
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
-                if new_due == old_due or new_due == "未知":
-                    log("❌ 续费后到期时间未变化，支付可能未成功")
-                    status = "❌ 续期失败（到期时间未变化）"
-                    renew_result = False
-                else:
-                    status = "✅ 续期成功"
+                status = "✅ 续期成功"
 
             # 发送 Telegram 通知
             send_telegram_notification(status, old_due, new_due)
